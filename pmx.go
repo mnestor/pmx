@@ -24,19 +24,19 @@ type Executor interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }
 
-func Insert(ctx context.Context, e Executor, entity any) (pgconn.CommandTag, error) {
+func prepareInsert(entity any) (*bytes.Buffer, []any, bool) {
 	t := reflect.TypeOf(entity)
 	v := reflect.ValueOf(entity)
 
 	if t.Kind() != reflect.Ptr {
-		return pgconn.CommandTag{}, ErrInvalidRef
+		return nil, nil, false
 	}
 
 	t = t.Elem()
 	v = v.Elem()
 
 	if t.Kind() != reflect.Struct {
-		return pgconn.CommandTag{}, ErrInvalidRef
+		return nil, nil, false
 	}
 
 	buf := bytes.NewBufferString(fmt.Sprintf(
@@ -72,19 +72,46 @@ func Insert(ctx context.Context, e Executor, entity any) (pgconn.CommandTag, err
 		strings.Join(values, ", "),
 	))
 
-	if slices.Contains(values, "default") {
-		buf.WriteString(" returning *")
-		rows, err := e.Query(ctx, buf.String(), args...)
-		if err != nil {
-			return pgconn.CommandTag{}, err
-		}
-		defer rows.Close()
-		err = scan(rows, entity)
-		if err != nil {
-			return pgconn.CommandTag{}, err
-		}
-		rows.Close()
-		return rows.CommandTag(), nil
+	return buf, args, slices.Contains(values, "default")
+}
+
+func ExecReturns(ctx context.Context, e Executor, dest any, sql string, args ...any) (pgconn.CommandTag, error) {
+	sql = sql + " returning *"
+	rows, err := e.Query(ctx, sql, args...)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	defer rows.Close()
+	err = scan(rows, dest)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	rows.Close()
+	return rows.CommandTag(), nil
+}
+
+func Upsert(ctx context.Context, e Executor, entity any, conflict string) (pgconn.CommandTag, error) {
+	buf, args, hasDefaults := prepareInsert(entity)
+
+	if len(conflict) > 0 {
+		buf.WriteString(fmt.Sprintf(
+			" %s",
+			conflict,
+		))
+	}
+
+	if hasDefaults {
+		return ExecReturns(ctx, e, entity, buf.String(), args...)
+	}
+
+	return e.Exec(ctx, buf.String(), args...)
+}
+
+func Insert(ctx context.Context, e Executor, entity any) (pgconn.CommandTag, error) {
+	buf, args, hasDefaults := prepareInsert(entity)
+
+	if hasDefaults {
+		return ExecReturns(ctx, e, entity, buf.String(), args...)
 	}
 
 	return e.Exec(ctx, buf.String(), args...)
